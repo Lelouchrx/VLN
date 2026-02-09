@@ -1,0 +1,102 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.htmlcov
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints
+
+# ========== 数据与权重（不提交） ==========
+# 仅忽略项目根目录下的 data/（轨迹、场景等），不忽略 vln/qwenvl/data/ 代码
+/data/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# 缓存与日志
+cache/
+logs/
+*.log
+results/
+output/
+wandb/
+
+# Habitat / 场景数据
+scene_datasets/
+*.glb
+*.ply
+
+# 系统与临时
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+.cursor/
+
+# 大文件 / 下载
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Habitat-Lab 等依赖（体积大，建议 pip 安装或单独 clone）
+deps/
