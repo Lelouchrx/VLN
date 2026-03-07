@@ -184,8 +184,10 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
 
             messages.append({"role": role, "content": content})
         else:
+            # Assistant messages contain only text
             messages.append({"role": role, "content": [{"type": "text", "text": text}]})
 
+    # Check for unused media files
     if image_pool:
         raise ValueError(
             f"{len(image_pool)} image(s) remain unused (not consumed by placeholders)"
@@ -291,6 +293,7 @@ class LazySupervisedDataset(Dataset):
 
         rank0_print(f"Total training samples: {len(list_data_dict)}")
 
+        random.shuffle(list_data_dict)  # Randomly shuffle the data for training
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         processor = update_processor_pixels(processor, data_args)
@@ -678,11 +681,11 @@ def make_supervised_data_module(processor, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     # Check if VLN datasets are being used
     dataset_names = data_args.dataset_use.split(",")
+    #TODO: Add vln dataset judgement
     is_vln_dataset = any("trajectory_data" in name or "dagger_data" in name for name in dataset_names)
 
     if is_vln_dataset:
         # Use VLN dataset for navigation tasks
-
         train_dataset = VLNActionDataset(processor, data_args)
         data_collator = DataCollatorForVLNDataset(processor.tokenizer)
     else:
@@ -705,46 +708,37 @@ class DataCollatorForVLNDataset:
         self.tokenizer = tokenizer
 
     def __call__(self, batch):
-        # Filter out None samples
         batch = [item for item in batch if item is not None]
         if len(batch) == 0:
             return {}
 
-        # Process text inputs
         input_ids = [item["input_ids"] for item in batch]
         labels = [item.get("labels", item["input_ids"]) for item in batch]
-        attention_masks = [item.get("attention_mask", torch.ones_like(item["input_ids"])) for item in batch]
+        position_ids = [item["position_ids"] for item in batch]
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=IGNORE_INDEX
+        )
+        position_ids = pad_and_cat(position_ids)
+        input_ids = input_ids[:, : self.tokenizer.model_max_length]
+        labels = labels[:, : self.tokenizer.model_max_length]
+        position_ids = position_ids[:, :, : self.tokenizer.model_max_length]
 
-        # Pad text sequences
-        max_len = max(len(ids) for ids in input_ids)
-        padded_input_ids = []
-        padded_labels = []
-        padded_attention_masks = []
+        batch_out = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
+            "position_ids": position_ids,
+        }
 
-        for ids, lbl, mask in zip(input_ids, labels, attention_masks):
-            pad_len = max_len - len(ids)
-            padded_ids = torch.cat([ids, torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=ids.dtype)])
-            padded_lbl = torch.cat([lbl, torch.full((pad_len,), IGNORE_INDEX, dtype=lbl.dtype)])
-            padded_mask = torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)])
-
-            padded_input_ids.append(padded_ids)
-            padded_labels.append(padded_lbl)
-            padded_attention_masks.append(padded_mask)
-
-        # Stack text tensors
-        input_ids = torch.stack(padded_input_ids)
-        labels = torch.stack(padded_labels)
-        attention_mask = torch.stack(padded_attention_masks)
-
-        # Handle pixel_values
         pixel_values = [item.get("pixel_values", None) for item in batch]
         if all(pv is not None for pv in pixel_values):
-            # Concatenate all pixel values along batch dimension
             pixel_values = torch.cat([pv for pv in pixel_values], dim=0)
         else:
             pixel_values = None
 
-        # Handle image_grid_thw
         image_grid_thw = [item.get("image_grid_thw", None) for item in batch]
         if all(grid is not None for grid in image_grid_thw):
             grids = []
@@ -756,18 +750,12 @@ class DataCollatorForVLNDataset:
         else:
             image_grid_thw = None
 
-        result = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-        }
-        
         if pixel_values is not None:
-            result["pixel_values"] = pixel_values
+            batch_out["pixel_values"] = pixel_values
         if image_grid_thw is not None:
-            result["image_grid_thw"] = image_grid_thw
+            batch_out["image_grid_thw"] = image_grid_thw
 
-        return result
+        return batch_out
 
 
 class VLNActionDataset(Dataset):
@@ -781,10 +769,20 @@ class VLNActionDataset(Dataset):
         self.processor = processor
         self.data_args = data_args
 
-        self.num_frames = data_args.num_frames
+        self.num_frames = max(1, int(getattr(data_args, "num_frames", 8)))
+        self.num_future_steps = max(1, int(getattr(data_args, "num_future_steps", 4)))
+        #TODO: max_action_steps 确认是否需要修改
+        self.max_action_steps = max(1, int(getattr(data_args, "vln_max_frames", 32)))
         self.remove_init_turns = data_args.remove_init_turns
+        self.model_type = getattr(data_args, "model_type", "qwen3vl")
+        if self.model_type == "qwen3vl":
+            self.get_rope_index = get_rope_index_3
+        elif self.model_type == "qwen2.5vl":
+            self.get_rope_index = get_rope_index_25
+        else:
+            self.get_rope_index = get_rope_index_2
+        self.merge_size = getattr(self.processor.image_processor, "merge_size", 2)
 
-        # Load VLN datasets based on data_args.dataset_use
         dataset_names = data_args.dataset_use.split(",")
         self.nav_data = []
 
@@ -798,11 +796,19 @@ class VLNActionDataset(Dataset):
             instructions = item['instructions']
             actions = item['actions']
             actions_len = len(actions)
-            if actions_len < 4:
+            if actions_len < 2:
                 continue
 
             if not isinstance(instructions, list):
                 instructions = [instructions]
+
+            video_path = item['video']
+            rgb_path = os.path.join(video_path, 'rgb')
+            if not os.path.exists(rgb_path):
+                continue
+            frame_count = len([f for f in os.listdir(rgb_path) if f.endswith(('.jpg', '.png'))])
+            if frame_count == 0:
+                continue
 
             for ins_id in range(len(instructions)):
                 valid_idx = 0
@@ -811,11 +817,18 @@ class VLNActionDataset(Dataset):
                     if valid_idx != 0:
                         invalid_len += 1
 
-                if actions_len - valid_idx < 4:
+                action_sequence = actions[1 + valid_idx:] + [0]
+                action_steps = len(action_sequence)
+                available_frames = max(0, frame_count - valid_idx)
+                valid_steps = min(action_steps, available_frames, self.max_action_steps)
+                if valid_steps <= 0:
                     continue
 
-                # Simple episode-level processing instead of sliding windows
-                self.data_list.append((ep_id, ins_id, 0, valid_idx))
+                for t in range(valid_steps):
+                    future_actions = action_sequence[t:t + self.num_future_steps]
+                    if len(future_actions) < self.num_future_steps:
+                        continue
+                    self.data_list.append((ep_id, ins_id, valid_idx, t, valid_steps))
 
         self.idx2actions = {
             '0': 'STOP',
@@ -872,7 +885,7 @@ class VLNActionDataset(Dataset):
         return len(self.data_list)
 
     def __getitem__(self, i):
-        ep_id, ins_id, start_idx, valid_idx = self.data_list[i]
+        ep_id, ins_id, valid_idx, t, valid_steps = self.data_list[i]
         data = self.nav_data[ep_id]
         video_path = data['video']
         rgb_path = os.path.join(video_path, 'rgb')
@@ -888,38 +901,37 @@ class VLNActionDataset(Dataset):
         instructions = data.get("instructions", None)
         if not isinstance(instructions, list):
             instructions = [instructions]
+        instruction = instructions[ins_id]
 
-        actions = data['actions'][1+valid_idx:] + [0]
-        actions_len = len(actions)
+        action_sequence = data['actions'][1 + valid_idx:] + [0]
+        action_sequence = action_sequence[:valid_steps]
+        # history frame stacking logic removed for step-level training
+        frame_idx = valid_idx + t
+        if frame_idx >= len(video_frames):
+            raise IndexError(f"Frame index out of range: {frame_idx} >= {len(video_frames)}")
+        image_file = os.path.join(rgb_path, video_frames[frame_idx])
+        with Image.open(image_file) as img:
+            image = img.convert('RGB').copy()
+        images = [image]
+        image_tokens = "<|vision_start|><|image_pad|><|vision_end|>"
 
-        num_frames_to_use = min(self.num_frames, len(video_frames))
-        if actions_len < num_frames_to_use:
-            actions = actions + [actions[-1]] * (num_frames_to_use - actions_len)
-        else:
-            actions = actions[:num_frames_to_use]
+        prev_action_text = "<START>" if t == 0 else self.idx2actions[str(action_sequence[t - 1] if action_sequence[t - 1] in (0, 1, 2, 3) else 0)]
+        target_actions = action_sequence[t:t + self.num_future_steps]
+        target_actions = [act if act in (0, 1, 2, 3) else 0 for act in target_actions]
 
-        actions = np.array(actions)
-        sample_step_ids = np.linspace(0, len(video_frames)-1, num_frames_to_use, dtype=np.int32)
-        sample_frames = [os.path.join(rgb_path, video_frames[i]) for i in sample_step_ids]
-
-        images = []
-        for image_file in sample_frames:
-            with Image.open(image_file) as img:
-                image = img.convert('RGB').copy()
-            images.append(image)
-
-        image_tokens = "".join([f"<|vision_start|><|image_pad|><|vision_end|>" for _ in images])
-        
         messages = [
             {
-                "role": "user",
-                "content": f"{image_tokens}\nNavigation instruction: {instructions[ins_id]}\nWhat actions should I take?"
-            },
-            {
-                "role": "assistant",
-                "content": self.actions2text(actions.tolist())
+                "role": "system",
+                "content": "You are an autonomous navigation assistant. Output actions using only MOVE_FORWARD TURN_LEFT TURN_RIGHT STOP."
             }
         ]
+        messages.append(
+            {
+                "role": "user",
+                "content": f"{image_tokens}\nInstruction: {instruction}\nPrevious action: {prev_action_text}\nPredict the next {self.num_future_steps} actions."
+            }
+        )
+        messages.append({"role": "assistant", "content": self.actions2text(target_actions)})
 
         text_input = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         processed = self.processor(
@@ -930,24 +942,27 @@ class VLNActionDataset(Dataset):
 
         input_ids = processed["input_ids"][0]
         labels = torch.full_like(input_ids, IGNORE_INDEX)
-        
         input_ids_list = input_ids.tolist()
-        for pos in range(len(input_ids_list)):
+        pos = 0
+        while pos < len(input_ids_list):
             if input_ids_list[pos] == 77091:
-                ans_start = pos + 2
+                ans_start = pos + 3
                 ans_end = ans_start
                 while ans_end < len(input_ids_list) and input_ids_list[ans_end] != 151645:
                     ans_end += 1
                 if ans_end < len(input_ids_list):
                     labels[ans_start:ans_end + 1] = input_ids[ans_start:ans_end + 1]
-                break
-        
+                    pos = ans_end
+            pos += 1
+
+        attention_mask = processed["attention_mask"] if "attention_mask" in processed else torch.ones_like(processed["input_ids"])
         result = {
             "input_ids": input_ids,
             "labels": labels,
-            "attention_mask": processed["attention_mask"][0] if "attention_mask" in processed else None,
+            "attention_mask": attention_mask[0],
+            "messages": messages,
         }
-        
+
         if "pixel_values" in processed:
             result["pixel_values"] = processed["pixel_values"]
         if "image_grid_thw" in processed and processed["image_grid_thw"] is not None:
@@ -955,20 +970,30 @@ class VLNActionDataset(Dataset):
             if grid_thw.dim() == 1:
                 grid_thw = grid_thw.unsqueeze(0)
             result["image_grid_thw"] = grid_thw
-        
+            position_ids, _ = self.get_rope_index(
+                self.merge_size,
+                processed["input_ids"],
+                image_grid_thw=grid_thw,
+                attention_mask=attention_mask,
+            )
+        else:
+            position_ids, _ = self.get_rope_index(
+                self.merge_size,
+                processed["input_ids"],
+                attention_mask=attention_mask,
+            )
+        result["position_ids"] = position_ids
+
         return result
 
     def actions2text(self, actions):
-        """Convert actions to text format."""
         converted_sequence = []
         for action in actions:
             act_text = self.idx2actions[str(action)]
             if type(act_text) == list:
                 act_text = random.choice(act_text)
             converted_sequence.append(act_text)
-
-        text = ''.join(converted_sequence)
-        return text
+        return ", ".join(converted_sequence)
 
 
 if __name__ == "__main__":

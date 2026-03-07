@@ -35,6 +35,7 @@ from habitat.utils.visualizations import maps
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLModel, Qwen3VLProcessor
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
+from peft import PeftConfig, PeftModel
 
 from vln.utils.dist import *
 
@@ -114,8 +115,12 @@ class VLNEvaluator:
             "TURN_LEFT": [2],
             "TURN_RIGHT": [3]
         })
-
         self.num_frames = args.num_frames if hasattr(args, 'num_frames') else 1
+        self.num_future_steps = args.num_future_steps if hasattr(args, "num_future_steps") else 4
+        self.max_new_tokens = args.max_new_tokens if hasattr(args, "max_new_tokens") else 32
+        self.trace_mode = args.trace_mode if hasattr(args, "trace_mode") else "fail"
+        self.trace_dir = os.path.join(self.output_path, "traces")
+        os.makedirs(self.trace_dir, exist_ok=True)
         
     def config_env(self) -> Env:
         env = Env(config=self.config)
@@ -171,6 +176,8 @@ class VLNEvaluator:
 
                 rgb_list = []
                 action_seq = []
+                prev_action_text = "<START>"
+                trace_records = []
                 while not env.episode_over:
                     # self.model.eval()
                     rgb = observations["rgb"]
@@ -186,35 +193,73 @@ class VLNEvaluator:
                     # import ipdb; ipdb.set_trace()
                     # print(f"action_seq = {action_seq}", flush=True)
                     if len(action_seq) == 0:
-                        
+                        parse_mode = "keyword"
                         history_len = len(rgb_list) - 1
-                        if history_len <= self.num_frames:
-                            history_images = rgb_list[:history_len]
-                            images = history_images + [rgb_list[-1]]
+                        if self.num_frames <= 1:
+                            images = [rgb_list[-1]]
+                        elif history_len < self.num_frames:
+                            images = rgb_list
                         else:
-                            indices = np.linspace(0, history_len, self.num_frames + 1, dtype=int)
+                            start_idx = max(0, history_len - self.num_frames + 1)
+                            indices = np.linspace(start_idx, history_len, self.num_frames, dtype=int)
                             images = [rgb_list[i] for i in indices]
 
-                        llm_outputs = self.model.call_model(images, episode_instruction, step_id)[0]
+                        llm_outputs = self.model.call_model(
+                            images,
+                            episode_instruction,
+                            step_id,
+                            prev_action_text=prev_action_text,
+                            max_new_tokens=self.max_new_tokens,
+                        )[0]
                         
-                        # outputs = self.model.generate(**input_dict, do_sample=False, num_beams=1, max_new_tokens=10000)
-                        # output_ids = outputs.sequences
-                        # llm_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)[0].strip()
                         print(llm_outputs, flush=True)
-                        # action_seq = self.parse_actions(llm_outputs)
-                        if llm_outputs in self.actions2idx:
-                            action_seq = list(self.actions2idx[llm_outputs])
-                        else:
+                        action_seq = self.parse_actions(llm_outputs)
+                        if len(action_seq) == 0:
+                            parse_mode = "compact_keyword"
+                            action_seq = self.parse_actions(llm_outputs.upper().replace(" ", ""))
+                        if len(action_seq) == 0:
+                            parse_mode = "digit"
+                            digit_actions = re.findall(r"[0-3]", llm_outputs)
+                            action_seq = [int(a) for a in digit_actions]
+                        if len(action_seq) == 0:
+                            parse_mode = "fallback_stop"
                             action_seq = [0]
-
+                        trace_records.append(
+                            {
+                                "step_id": int(step_id),
+                                "event": "generation",
+                                "instruction": episode_instruction,
+                                "prev_action_text": prev_action_text,
+                                "llm_outputs": llm_outputs,
+                                "parse_mode": parse_mode,
+                                "predicted_actions": list(action_seq),
+                                "distance_to_goal": float(info["distance_to_goal"]) if "distance_to_goal" in info else None,
+                            }
+                        )
                         print('actions', action_seq, flush=True)
-                        if len(action_seq) == 0: ## if generated llm without Specific values
-                            action_seq = [0]
                     action = action_seq.pop(0)
                     if step_id >= 400:
                         action = 0
+                    trace_records.append(
+                        {
+                            "step_id": int(step_id),
+                            "event": "execute",
+                            "action": int(action),
+                            "remaining_cached_actions": int(len(action_seq)),
+                        }
+                    )
                     
                     observations = env.step(action)
+                    if action == 0:
+                        prev_action_text = "STOP"
+                    elif action == 1:
+                        prev_action_text = "MOVE_FORWARD"
+                    elif action == 2:
+                        prev_action_text = "TURN_LEFT"
+                    elif action == 3:
+                        prev_action_text = "TURN_RIGHT"
+                    else:
+                        prev_action_text = "STOP"
 
                     # try:
                     #     info = env.get_metrics()
@@ -263,6 +308,22 @@ class VLNEvaluator:
                     "steps": step_id,
                     "episode_instruction": episode_instruction
                 }
+                should_dump_trace = (self.trace_mode == "all") or (self.trace_mode == "fail" and metrics["success"] < 1.0)
+                if should_dump_trace:
+                    trace_payload = {
+                        "scene_id": scene_id,
+                        "episode_id": episode_id,
+                        "episode_instruction": episode_instruction,
+                        "success": float(metrics["success"]),
+                        "spl": float(metrics["spl"]),
+                        "os": float(metrics["oracle_success"]),
+                        "ne": float(metrics["distance_to_goal"]),
+                        "steps": int(step_id),
+                        "trace": trace_records,
+                    }
+                    trace_path = os.path.join(self.trace_dir, f"{scene_id}_{episode_id}.json")
+                    with open(trace_path, "w") as tf:
+                        json.dump(trace_payload, tf, ensure_ascii=False)
                 
                 with open(os.path.join(self.output_path, f'result.json'), 'a') as f:
                     f.write(json.dumps(result) + "\n")
@@ -273,35 +334,75 @@ class VLNEvaluator:
     def parse_actions(self, output):
         action_patterns = '|'.join(re.escape(action) for action in self.actions2idx)
         # import ipdb; ipdb.set_trace()
-        regex = re.compile(action_patterns)
+        regex = re.compile(action_patterns, flags=re.IGNORECASE)
         matches = regex.findall(output)
-        actions = [self.actions2idx[match] for match in matches]
+        actions = [self.actions2idx[match.upper()] for match in matches]
         actions = itertools.chain.from_iterable(actions)
         return list(actions)
     
 class VLN_Inference:
-    def __init__(self, model_path, device="cuda"):
-        config = AutoConfig.from_pretrained(model_path)
-        self.device = device
+    def __init__(self, model_path, device="cuda", num_future_steps=4, processor_path=None):
+        self.device = device if isinstance(device, str) else str(device)
+        self.num_future_steps = num_future_steps
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            peft_config = PeftConfig.from_pretrained(model_path)
+            base_model_path = peft_config.base_model_name_or_path
+            base_config = AutoConfig.from_pretrained(base_model_path)
+            base_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                base_model_path,
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+                config=base_config,
+                low_cpu_mem_usage=True,
+                device_map={"": self.device},
+            )
+            self.model = PeftModel.from_pretrained(base_model, model_path).merge_and_unload().eval()
+        else:
+            config = AutoConfig.from_pretrained(model_path)
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_path,
                 attn_implementation="eager",
-                dtype=torch.bfloat16,
+                torch_dtype=torch.bfloat16,
                 config=config,
-                low_cpu_mem_usage=False,
-                ).eval()
-        self.processor = AutoProcessor.from_pretrained(model_path)
+                low_cpu_mem_usage=True,
+                device_map={"": self.device},
+            ).eval()
+        self.processor = self._load_processor(model_path, processor_path)
 
-    def call_model(self, observations, task, step_id):
+    @staticmethod
+    def _load_processor(model_path: str, processor_path: str = None):
+        if processor_path:
+            return AutoProcessor.from_pretrained(processor_path)
+
+        # Some training checkpoints only save weights/tokenizer and miss
+        # preprocessor_config.json. In that case, fallback to parent folders.
+        candidates = [model_path]
+        parent_1 = os.path.dirname(model_path)
+        parent_2 = os.path.dirname(parent_1) if parent_1 else ""
+        if parent_1 and parent_1 not in candidates:
+            candidates.append(parent_1)
+        if parent_2 and parent_2 not in candidates:
+            candidates.append(parent_2)
+
+        for candidate in candidates:
+            if os.path.exists(os.path.join(candidate, "preprocessor_config.json")):
+                return AutoProcessor.from_pretrained(candidate)
+
+        raise OSError(
+            f"Can't load image processor from {model_path}. "
+            "Please provide --processor_path that contains preprocessor_config.json."
+        )
+
+    def call_model(self, observations, task, step_id, prev_action_text="<START>", max_new_tokens=32):
         messages = [
             {
-                "role": "system", 
-                "content": "You are a visual language navigation model, and your should go to the locations to complete the given task. Compare the observation and instruction to infer your current progress, and then select the correct direction from the candidates to go to the target location and finish the task."
+                "role": "system",
+                "content": "You are an autonomous navigation assistant. Output actions using only MOVE_FORWARD TURN_LEFT TURN_RIGHT STOP."
             }
         ]
-        
-        context = f"These images are your historical observations and your current observation.\n Your task is to {task} \n You should take one of the following actions:\n MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."
+        context = f"Instruction: {task}\nPrevious action: {prev_action_text}\nPredict the next {self.num_future_steps} actions."
         
         visual = observations
         if isinstance(visual, Image.Image): 
@@ -343,6 +444,7 @@ class VLN_Inference:
         )
         
         inputs = inputs.to(self.device)
+        torch.cuda.empty_cache()
     
         # TODO: Set generation parameters
         # if "max_new_tokens" not in gen_kwargs:
@@ -365,7 +467,14 @@ class VLN_Inference:
             #     eos_token_id=self.tokenizer.eos_token_id,
             #     pad_token_id=self.tokenizer.pad_token_id,
             # )
-            outputs = self.model.generate(**inputs, do_sample=False, num_beams=1, max_new_tokens=10000)
+            outputs = self.model.generate(
+                **inputs,
+                do_sample=False,
+                num_beams=1,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
 
         generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, outputs)]
         answers = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
@@ -381,7 +490,12 @@ def eval():
     parser.add_argument("--eval_split", type=str, default='val_unseen')
     parser.add_argument("--output_path", type=str, default='./results/val_unseen/streamvln')
     parser.add_argument("--save_video", action="store_true", default=False)
-    parser.add_argument("--num_history", type=int, default=8)
+    parser.add_argument("--num_frames", type=int, default=1, help="Number of frames to sample")
+    parser.add_argument("--num_future_steps", type=int, default=4)
+    parser.add_argument("--max_new_tokens", type=int, default=32)
+    parser.add_argument("--trace_mode", type=str, default="fail")
+    parser.add_argument("--processor_path", type=str, default="",
+                        help="Optional processor path containing preprocessor_config.json")
     parser.add_argument("--model_max_length", type=int, default=4096,
                         help= "Maximum sequence length. Sequences will be right padded (and possibly truncated).")
     
@@ -399,11 +513,15 @@ def eval():
     args = parser.parse_args()
     init_distributed_mode(args)
     local_rank = args.local_rank
+    device = f"cuda:{local_rank}"
 
-    model = VLN_Inference(args.model_path, device=args.device)
-    
+    model = VLN_Inference(
+        args.model_path,
+        device=device,
+        num_future_steps=args.num_future_steps,
+        processor_path=(args.processor_path or None),
+    )
     model.model.requires_grad_(False)
-    model.model.to(local_rank)
     evaluate(model, args)
 
 

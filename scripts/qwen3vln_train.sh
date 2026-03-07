@@ -7,9 +7,6 @@ eval "$(conda shell.bash hook)"
 conda activate streamvln
 
 export CUDA_VISIBLE_DEVICES=0,1
-export NCCL_P2P_DISABLE=1
-export NCCL_IB_DISABLE=1
-export NCCL_NVLS_ENABLE=0
 export DS_BUILD_FUSED_ADAM=0
 export DS_BUILD_FUSED_LAMB=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
@@ -21,7 +18,7 @@ export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29500
 
 CHECKPOINT="/media/mldadmin/home/s125mdg38_06/StreamVLN/checkpoints/checkpoints/Qwen3-VL-4B-Instruct"
-OUTPUT_DIR="/media/mldadmin/home/s125mdg38_06/StreamVLN/checkpoints/checkpoints/Qwen3-VL-4B-Instruct_TUNE"
+OUTPUT_DIR="/media/mldadmin/home/s125mdg38_06/StreamVLN/checkpoints/checkpoints/Qwen3-VL-4B-Instruct_LORA_S4"
 CACHE_DIR="./cache"
 DATASETS="data/trajectory_data/R2R,data/trajectory_data/RxR"
 
@@ -37,17 +34,21 @@ torchrun \
   --model_name_or_path $CHECKPOINT \
   --tune_mm_llm False \
   --tune_mm_vision False \
-  --tune_mm_mlp True \
-  --tune_mm_llm_high True \
+  --tune_mm_mlp False \
+  --tune_mm_llm_high False \
   --dataset_use $DATASETS \
   --output_dir $OUTPUT_DIR \
   --cache_dir $CACHE_DIR \
   --bf16 \
-  --per_device_train_batch_size 2 \
+  --lora_enable True \
+  --lora_r 16 \
+  --lora_alpha 32 \
+  --lora_dropout 0.05 \
+  --per_device_train_batch_size 8 \
   --gradient_accumulation_steps 4 \
   --learning_rate 2e-5 \
   --mm_projector_lr 1e-5 \
-  --model_max_length 32768 \
+  --model_max_length 2048 \
   --max_pixels $((256*28*28)) \
   --min_pixels $((16*28*28)) \
   --num_train_epochs 1 \
@@ -55,12 +56,15 @@ torchrun \
   --lr_scheduler_type cosine \
   --weight_decay 0.01 \
   --logging_steps 10 \
-  --save_steps 200 \
+  --save_steps 500 \
   --save_total_limit 1 \
   --gradient_checkpointing \
-  --dataloader_num_workers 0 \
-  --dataloader_persistent_workers False \
-  --num_frames 8 \
+  --dataloader_num_workers 4 \
+  --dataloader_persistent_workers True \
+  --num_frames 1 \
+  --num_future_steps 4 \
+  --remove_unused_columns False \
+  --ddp_find_unused_parameters False \
   --seed 42 \
   --report_to none \
   --deepspeed scripts/zero3.json \
