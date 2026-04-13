@@ -1,0 +1,105 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.htmlcov
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints
+
+/data/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# 缓存与日志
+cache/
+logs/
+*.log
+results/
+output/
+wandb/
+
+# Habitat / 场景数据
+scene_datasets/
+*.glb
+*.ply
+
+# 系统与临时
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+.cursor/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+habitat-lab/
+habitat-sim/
+
+# 其他大依赖
+deps/
+
+# exclude temp/duplicates
+vln/qwen3vln_eval copy*.py
+vln/stremvln_train.py

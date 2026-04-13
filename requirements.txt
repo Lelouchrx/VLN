@@ -1,0 +1,7 @@
+torch==2.6.0+cu124
+transformers==4.57.6
+accelerate==1.13.0
+flash-attn==2.7.2.post1
+peft==0.18.1
+habitat-lab==0.2.4
+habitat-sim==0.2.4
