@@ -4,26 +4,34 @@
 - `vln / vllm`：`python==3.10`
 - `llamafactory`：`python==3.12`
 
-## 2. llamafactory
+## 1. llamafactory
 ```bash
 pip install -e ".[torch,metrics]" --no-build-isolation -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/
 ```
 
-## 3. vllm
+## 2. vllm
 ```bash
 pip install vllm==0.16.0
 bash VLN/scripts/vllm_qwenvln.sh
 ```
 
-## 4. 仿真/交互环境（vln）
+## 3. 仿真/交互环境（vln）
 ```bash
 pip install -r requirements.txt
 ```
 
-## 5.Habitat安装
+## 4.Habitat安装
 ```bash
 bash tool/habitat.sh
 ```
+
+## 5. VLN-CE Episodes
+
+Download the VLN-CE episodes and extract them into the `data/datasets/` directory:
+
+- [r2r](https://drive.google.com/file/d/1fo8F4NKgZDH-bPSdVU3cONAkt5EW-tyr/view) (Rename `R2R_VLNCE_v1-3_preprocessed/` -> `r2r/`)
+- [rxr](https://drive.google.com/file/d/145xzLjxBaNTbVgBfQ8e9EsBAV8W-SM0t/view) (Rename `RxR_VLNCE_v0/` -> `rxr/`)
+- [scalevln](https://huggingface.co/datasets/cywan/StreamVLN-Trajectory-Data/blob/main/ScaleVLN/scalevln_subset_150k.json.gz) (Follow the StreamVLN to convert a subset of the ScaleVLN dataset into the VLN-CE format.)
 
 ## 6. 工具
 ```bash
@@ -41,4 +49,9 @@ python tool/download_mp.py
 # 下载 ScanNetv2
 conda activate vln
 python tool/download_scannetv2.py
+```
+
+## 7. dagger运行
+```bash
+bash scripts/habitat.sh
 ```
