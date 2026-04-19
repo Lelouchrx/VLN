@@ -3,8 +3,10 @@
 defaults:
   - /habitat: habitat_config_base
   - /habitat/task: vln_r2r
-  # v0.2.4 uses agents/ not sensor_setups/
-  - /habitat/simulator/agents@habitat.simulator.agents.main_agent: rgbd_agent
+  # v0.3.3
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgbd_agent
+  # v0.2.4
+  # - /habitat/simulator/agents@habitat.simulator.agents.main_agent: rgbd_agent
   - /habitat/dataset/vln: mp3d_r2r
   - /habitat/task/lab_sensors:
     - gps_sensor

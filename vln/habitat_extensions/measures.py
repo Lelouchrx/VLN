@@ -12,19 +12,18 @@ from habitat.core.embodied_task import Action, EmbodiedTask, Measure
 from habitat.core.logging import logger
 from habitat.core.registry import registry
 from habitat.core.simulator import Simulator
+# from habitat.core.utils import try_cv2_import
 from habitat.tasks.nav.nav import DistanceToGoal, Success
 from habitat.tasks.utils import cartesian_to_polar
 from habitat.utils.geometry_utils import quaternion_rotate_vector
 from habitat.utils.visualizations import fog_of_war
 from habitat.utils.visualizations import maps as habitat_maps
 from numpy import ndarray
+from omegaconf import DictConfig
 # from utils import maps
 # from habitat_extensions.task import RxRVLNCEDatasetV1
 
-try:
-    import cv2
-except ImportError:
-    cv2 = None
+# cv2 = try_cv2_import()
 
 
 def euclidean_distance(
@@ -97,9 +96,10 @@ class OracleSuccess(Measure):
     #     self._config = config
     #     super().__init__()
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(**kwargs)
-        self._config = kwargs.get("config")
+    def __init__(self, *args: Any, config: Any, **kwargs: Any):
+        print(f"in oracle success init: args = {args}, kwargs = {kwargs}")
+        self._config = config
+        super().__init__()
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
         return self.cls_uuid
@@ -113,8 +113,8 @@ class OracleSuccess(Measure):
 
     def update_metric(self, *args: Any, task: EmbodiedTask, **kwargs: Any):
         d = task.measurements.measures[DistanceToGoal.cls_uuid].get_metric()
-        # self._metric = float(self._metric or d < self._config["success_distance"])
-        self._metric = float(self._metric or d < 3.0)
+        thr = float(getattr(task.measurements.measures[Success.cls_uuid]._config, "success_distance", 3.0))
+        self._metric = float(self._metric or d < thr)
 
 
 @registry.register_measure
