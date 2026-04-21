@@ -4,13 +4,14 @@ defaults:
   - /habitat: habitat_config_base
   - /habitat/task: vln_r2r
   # v0.3.3
-  - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgbd_agent
+  # - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgbd_agent
   # v0.2.4
-  # - /habitat/simulator/agents@habitat.simulator.agents.main_agent: rgbd_agent
+  - /habitat/simulator/agents@habitat.simulator.agents.main_agent: rgbd_agent
   - /habitat/dataset/vln: mp3d_r2r
   - /habitat/task/lab_sensors:
     - gps_sensor
     - compass_sensor
+  - /habitat/task/measurements/oracle_success@habitat.task.measurements.oracle_success
   - _self_
 
 habitat:
@@ -50,7 +51,7 @@ habitat:
         type: SPL
       oracle_success:
         type: OracleSuccess
-        # success_distance: 3.0
+        success_distance: 3.0
       oracle_navigation_error:
         type: OracleNavigationError
 

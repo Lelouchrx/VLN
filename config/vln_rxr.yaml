@@ -11,6 +11,8 @@ defaults:
   - /habitat/task/lab_sensors:
     - gps_sensor
     - compass_sensor
+  - /habitat/task/measurements/oracle_success@habitat.task.measurements.oracle_success
+  - /habitat/task/measurements/ndtw@habitat.task.measurements.ndtw
   - _self_
 
 habitat:
@@ -50,9 +52,13 @@ habitat:
         type: SPL
       oracle_success:
         type: OracleSuccess
-        # success_distance: 3.0
+        success_distance: 3.0
       oracle_navigation_error:
         type: OracleNavigationError
+      ndtw:
+        type: NDTW
+        success_distance: 3.0
+        gt_path: /mnt/share172/cs22-hongly/DATACENTER/VLN_DATA/datasets/rxr/{split}/{split}_{role}_gt.json.gz
 
   dataset:
     # type: R2RVLN-v1

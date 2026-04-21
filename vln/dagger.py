@@ -82,11 +82,33 @@ class DAggerCollector:
         with gt_open(gt_path, 'rt', encoding='utf-8') as f:
             gt_data = json.load(f)
         gt_map = {}
-        for item in gt_data:
-            epid = item.get("episode_id", item.get("id"))
-            if epid is None:
-                continue
-            gt_map[str(epid)] = item
+        if isinstance(gt_data, dict):
+            # Support both {"episode_id": annotation, ...} and wrapped list formats.
+            candidate_list = None
+            for key in ("annotations", "episodes", "data"):
+                if isinstance(gt_data.get(key), list):
+                    candidate_list = gt_data[key]
+                    break
+            if candidate_list is None:
+                for epid, item in gt_data.items():
+                    if isinstance(item, dict):
+                        gt_map[str(epid)] = item
+            else:
+                for item in candidate_list:
+                    if not isinstance(item, dict):
+                        continue
+                    epid = item.get("episode_id", item.get("id"))
+                    if epid is None:
+                        continue
+                    gt_map[str(epid)] = item
+        else:
+            for item in gt_data:
+                if not isinstance(item, dict):
+                    continue
+                epid = item.get("episode_id", item.get("id"))
+                if epid is None:
+                    continue
+                gt_map[str(epid)] = item
         self.gt_annotations = gt_map
         
         with read_write(self.config):
