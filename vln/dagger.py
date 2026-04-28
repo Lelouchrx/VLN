@@ -1,5 +1,8 @@
 import os
 import sys
+
+os.environ.setdefault("HABITAT_SIM_MULTI_THREAD", "1")
+
 import torch
 import json
 import argparse
@@ -12,7 +15,6 @@ from utils.dist import *
 import torch.distributed as dist
 from vln.qwenvl.Evaluator import VLNEvaluator
 
-import os
 import re
 import itertools
 import random
@@ -170,6 +172,46 @@ class DAggerCollector:
             "situated ahead is ",
         ]
 
+    def _trim_llm_messages(self, messages: List[Dict]) -> None:
+        """
+        限制多轮 user/assistant 长度：保留 [system, 首轮带指令的 user]，从前往后删最旧的 (user, assistant) 对。
+        不删 messages[0:2]，避免丢掉任务指令与首帧视觉锚点。
+        """
+        max_m = int(getattr(self.args, "dagger_llm_max_messages", 0) or 0)
+        if max_m <= 0 or len(messages) <= max_m:
+            return
+        # 至少留 system + 首条 user（含 instruction + 首图）
+        while len(messages) > max_m and len(messages) > 2:
+            if len(messages) >= 4:
+                del messages[2:4]
+            else:
+                break
+
+    def _rgb_to_data_url(self, rgb) -> str:
+        """将观测 RGB 编码为 data URL；JPEG + 限边长可显著减小包体与 vLLM 算力。"""
+        img = Image.fromarray(rgb).convert("RGB")
+        max_side = int(getattr(self.args, "dagger_image_max_side", 0) or 0)
+        if max_side > 0:
+            w, h = img.size
+            scale = min(float(max_side) / float(w), float(max_side) / float(h), 1.0)
+            if scale < 1.0:
+                nw = max(1, int(round(w * scale)))
+                nh = max(1, int(round(h * scale)))
+                img = img.resize((nw, nh), Image.BILINEAR)
+        fmt = (getattr(self.args, "dagger_image_format", "jpeg") or "jpeg").lower()
+        if fmt == "jpg":
+            fmt = "jpeg"
+        buf = io.BytesIO()
+        if fmt == "jpeg":
+            q = int(getattr(self.args, "dagger_jpeg_quality", 85))
+            img.save(buf, format="JPEG", quality=q, optimize=True)
+            mime = "image/jpeg"
+        else:
+            img.save(buf, format="PNG", optimize=True)
+            mime = "image/png"
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:{mime};base64,{b64}"
+
     def _llm_scheduler_loop(self):
         while True:
             with self._llm_cond:
@@ -310,11 +352,9 @@ class DAggerCollector:
                                 messages_started = True
                             else:
                                 user_text = random.choice(self.visual_prompts)
-                            img = Image.fromarray(rgb).convert('RGB')
-                            buf = io.BytesIO()
-                            img.save(buf, format='PNG')
-                            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                            messages.append({'role': 'user', 'content': user_text, 'image_url': f"data:image/png;base64,{b64}"})
+                            data_url = self._rgb_to_data_url(rgb)
+                            messages.append({'role': 'user', 'content': user_text, 'image_url': data_url})
+                            self._trim_llm_messages(messages)
 
                             max_tokens = getattr(self.args, "max_new_tokens", 32)
                             llm_state = {"last_info": metrics or {}}
@@ -353,13 +393,11 @@ class DAggerCollector:
                                 chunk = chat_action_seq[idx:idx + 4]
                                 if idx > 0:
                                     chunk_user_text = random.choice(self.visual_prompts)
-                                    chunk_img = Image.fromarray(rgb).convert('RGB')
-                                    chunk_buf = io.BytesIO()
-                                    chunk_img.save(chunk_buf, format='PNG')
-                                    chunk_b64 = base64.b64encode(chunk_buf.getvalue()).decode("utf-8")
-                                    messages.append({'role': 'user', 'content': chunk_user_text, 'image_url': f"data:image/png;base64,{chunk_b64}"})
+                                    chunk_url = self._rgb_to_data_url(rgb)
+                                    messages.append({'role': 'user', 'content': chunk_user_text, 'image_url': chunk_url})
                                 assistant_text = ", ".join(evaluator.idx2action_text.get(a, "Stop") for a in chunk)
                                 messages.append({'role': 'assistant', 'content': assistant_text})
+                            self._trim_llm_messages(messages)
                             generated_this_round = True
                             generated_branch = "model"
                             generated_actions = list(chat_action_seq)
@@ -423,13 +461,12 @@ class DAggerCollector:
 
                 if evaluator is not None:
                     user_text = random.choice(self.visual_prompts)
-                    img = Image.fromarray(rgb).convert('RGB')
-                    buf = io.BytesIO()
-                    img.save(buf, format='PNG')
-                    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                    messages.append({'role': 'user', 'content': user_text, 'image_url': f"data:image/png;base64,{b64}"})
+                    data_url = self._rgb_to_data_url(rgb)
+                    messages.append({'role': 'user', 'content': user_text, 'image_url': data_url})
+                    self._trim_llm_messages(messages)
                     expert_text = evaluator.idx2action_text.get(action, "Move forward 25 cm")
                     messages.append({'role': 'assistant', 'content': expert_text})
+                    self._trim_llm_messages(messages)
                 generated_this_round = True
                 generated_branch = "expert"
                 generated_actions = [int(action)]
@@ -640,15 +677,21 @@ class DAggerCollector:
 
         def _collect_episode(ep):
             env_local = _get_thread_env()
-            env_local.current_episode = ep
-            env_local.current_episode.goals[0].radius = MIDGOAL_RADIUS
-            episode_dagger = self.generate(
-                env=env_local,
-                evaluator=evaluator,
-                save_video=self.args.dagger_save_video,
-                force_expert=self.args.force_expert,
-            )
-            return ep, episode_dagger
+            bo_n = max(1, int(getattr(self.args, 'dagger_bo_n', 1)))
+            last_episode_dagger = None
+            for attempt in range(bo_n):
+                env_local.current_episode = ep
+                env_local.current_episode.goals[0].radius = MIDGOAL_RADIUS
+                episode_dagger = self.generate(
+                    env=env_local,
+                    evaluator=evaluator,
+                    save_video=self.args.dagger_save_video,
+                    force_expert=self.args.force_expert,
+                )
+                last_episode_dagger = episode_dagger
+                if episode_dagger['metrics']['save']:
+                    break
+            return ep, last_episode_dagger
 
         num_collect_episodes = 0
         annotations_actions = []
@@ -667,6 +710,54 @@ class DAggerCollector:
                 seen.add(key)
                 out.append(item)
             return out
+
+        def _append_records_to_jsonl(path, records):
+            if not records:
+                return
+            with open(path, "a", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        def _load_records_from_jsonl(path):
+            if not os.path.exists(path):
+                return []
+            out = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            return out
+
+        def _materialize_pretty_json_from_jsonl(jsonl_path, pretty_json_path):
+            """One-time per rank: jsonl -> pretty-printed {prefix}_{rank}.json (compat)."""
+            recs = _load_records_from_jsonl(jsonl_path)
+            if not recs:
+                return
+            recs = _dedup_records(recs, "video", ("episode_id", "trajectory_id"))
+            with open(pretty_json_path, "w", encoding="utf-8") as jf:
+                jf.write(json.dumps(recs, ensure_ascii=False, indent=4))
+
+        ann_prefix = self.args.annotations_actions
+        rank_jsonl = os.path.join(self.output_path, f"{ann_prefix}_{self.rank}.jsonl")
+        rank_json = os.path.join(self.output_path, f"{ann_prefix}_{self.rank}.json")
+        # One-time: legacy .json shard -> .jsonl (append path for this run; avoids full re-read on each commit)
+        if os.path.exists(rank_json) and (not os.path.exists(rank_jsonl)):
+            with open(rank_json, "r", encoding="utf-8") as f:
+                legacy = json.load(f)
+            if not isinstance(legacy, list):
+                legacy = [legacy]
+            with open(rank_jsonl, "w", encoding="utf-8") as f:
+                for rec in legacy:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            try:
+                os.replace(rank_json, rank_json + ".bak")
+            except OSError:
+                pass
 
         with tqdm.tqdm(
             total=assigned_total,
@@ -755,16 +846,8 @@ class DAggerCollector:
                     })
 
                     if num_collect_episodes % self.dagger_config.commit_freq == 0:
-                        tgt_actions_path = os.path.join(self.output_path, f'{self.args.annotations_actions}_{self.rank}.json')
-                        if os.path.exists(tgt_actions_path):
-                            merged_actions = json.load(open(tgt_actions_path))
-                        else:
-                            merged_actions = []
-                        with open(tgt_actions_path, 'w') as json_file:
-                            merged_actions.extend(annotations_actions)
-                            merged_actions = _dedup_records(merged_actions, "video", ("episode_id", "trajectory_id"))
-                            json_data = json.dumps(merged_actions, indent=4)
-                            json_file.write(json_data)
+                        _append_records_to_jsonl(rank_jsonl, annotations_actions)
+                        annotations_actions.clear()
 
                     if processed_episodes >= self.dagger_config.update_size:
                         stop_collect = True
@@ -776,16 +859,10 @@ class DAggerCollector:
 
                 _submit_available()
 
-            tgt_actions_path = os.path.join(self.output_path, f'{self.args.annotations_actions}_{self.rank}.json')
-            if os.path.exists(tgt_actions_path):
-                merged_actions = json.load(open(tgt_actions_path))
-            else:
-                merged_actions = []
-            with open(tgt_actions_path, 'w') as json_file:
-                merged_actions.extend(annotations_actions)
-                merged_actions = _dedup_records(merged_actions, "video", ("episode_id", "trajectory_id"))
-                json_data = json.dumps(merged_actions, indent=4)
-                json_file.write(json_data)
+            _append_records_to_jsonl(rank_jsonl, annotations_actions)
+            annotations_actions.clear()
+            if os.path.exists(rank_jsonl):
+                _materialize_pretty_json_from_jsonl(rank_jsonl, rank_json)
 
             print(f"save total episodes {num_collect_episodes} time cost {time.time() - start}")
 
@@ -799,39 +876,46 @@ class DAggerCollector:
                     except Exception:
                         pass
 
-            close_futs = [
-                env_executor.submit(_close_thread)
-                for _ in range(max_workers)
-            ]
+            with thread_envs_lock:
+                n_pending = len(thread_envs)
+            n_attempts = max(max_workers, n_pending)
+            close_futs = [env_executor.submit(_close_thread) for _ in range(n_attempts)]
             for cf in close_futs:
                 try:
                     cf.result()
                 except Exception:
                     pass
 
-        for env_local in list(thread_envs.values()):
-            try:
-                env_local.close()
-            except Exception:
-                pass
+        # for env_local in list(thread_envs.values()):
+        #     try:
+        #         env_local.close()
+        #     except Exception:
+        #         pass
 
         dist.barrier()
         if get_rank() == 0:
             tgt_actions_path = os.path.join(self.output_path, f'{self.args.annotations_actions}.json')
             merged_actions = []
-            sub_tgt_actions_list = [
-                os.path.join(self.output_path, f)
-                for f in os.listdir(self.output_path)
-                if f.startswith(f'{self.args.annotations_actions}_') and f.endswith('.json')
-            ]
-            for sub_tgt_actions_path in sub_tgt_actions_list:
-                if os.path.exists(sub_tgt_actions_path):
-                    merged_actions.extend(json.load(open(sub_tgt_actions_path)))
-            merged_actions = sorted(merged_actions, key=lambda x: x['id'])
+            ann_pref = f"{self.args.annotations_actions}_"
+            out_dir = self.output_path
+            try:
+                names = os.listdir(out_dir)
+            except OSError:
+                names = []
+            # Prefer .jsonl shards; fallback to per-rank .json (legacy)
+            sub_jsonl = [os.path.join(out_dir, f) for f in names if f.startswith(ann_pref) and f.endswith(".jsonl")]
+            sub_json = [os.path.join(out_dir, f) for f in names if f.startswith(ann_pref) and f.endswith(".json")]
+            for sub_tgt_actions_path in sub_jsonl:
+                merged_actions.extend(_load_records_from_jsonl(sub_tgt_actions_path))
+            if not sub_jsonl and sub_json:
+                for sub_tgt_actions_path in sub_json:
+                    if not os.path.exists(sub_tgt_actions_path):
+                        continue
+                    merged_actions.extend(json.load(open(sub_tgt_actions_path, encoding="utf-8")))
+            merged_actions = sorted(merged_actions, key=lambda x: x["id"])
             merged_actions = _dedup_records(merged_actions, "video", ("episode_id", "trajectory_id"))
-            with open(tgt_actions_path, 'w') as json_file:
-                json_data = json.dumps(merged_actions, indent=4)
-                json_file.write(json_data)
+            with open(tgt_actions_path, "w", encoding="utf-8") as json_file:
+                json_file.write(json.dumps(merged_actions, ensure_ascii=False, indent=4))
 
         with self._llm_cond:
             self._llm_shutdown = True
@@ -872,6 +956,8 @@ def parse_args():
     parser.add_argument("--dagger_dataset", type=str, default=DATASET)
     parser.add_argument("--force_expert", action="store_true", default=False)
     parser.add_argument("--dagger_data_it", type=int, default=0)
+    parser.add_argument("--dagger_bo_n", type=int, default=1,
+                        help="best-of-n: if a trajectory is not saved, retry up to n times")
     parser.add_argument("--dagger_output_path",type=str, default="data/dagger")
     parser.add_argument("--dagger_data_path", type=str, default="data/datasets/vln_datasets/{split}.json.gz")
     parser.add_argument("--dagger_gt_annotations_path", type=str, default="data/datasets/vln_datasets/annotations.json")
@@ -879,7 +965,7 @@ def parse_args():
         "--annotations_actions",
         type=str,
         default="annotations_actions",
-        help="action annotation filename prefix, output as <prefix>.json",
+        help="action annotation file prefix: append-only <prefix>_<rank>.jsonl; shard <prefix>_<rank>.json from jsonl; merge <prefix>.json on rank0",
     )
     parser.add_argument(
         "--dagger_save_video",
