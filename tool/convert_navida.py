@@ -11,14 +11,6 @@ forward_distance = 25
 turn_angle = 15
 
 
-def noise_action(action_id):
-    p = random.random()
-    if p < 0.7 and action_id != 0:
-        return random.randint(1, 3)
-    else:
-        return action_id
-
-
 def action_id_to_str(action_id):
     if action_id == 0:
         return "stop"
@@ -98,13 +90,6 @@ def get_first(item, keys, default=None):
     return default
 
 
-def image_sort_key(x):
-    matched = re.findall(r"\d+", x)
-    if matched:
-        return int(matched[-1])
-    return x
-
-
 def get_episode_images(episode_item, image_root):
     direct_images = get_first(episode_item, ["images", "image", "image_paths", "rgb_paths"], None)
     if isinstance(direct_images, list) and len(direct_images) > 0:
@@ -133,8 +118,145 @@ def get_episode_images(episode_item, image_root):
         image for image in os.listdir(episode_image_path)
         if image.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
     ]
-    episode_image_list = sorted(episode_image_list, key=image_sort_key)
+    episode_image_list = sorted(
+        episode_image_list,
+        key=lambda x: int(re.findall(r"\d+", x)[-1]) if re.findall(r"\d+", x) else x
+    )
     return [episode_image_path + '/' + image for image in episode_image_list]
+
+
+def build_scene_frame_pool(annotation, image_root):
+    scene_pool = {}
+    for episode_item in tqdm(annotation, desc="build scene pools"):
+        trajectory_id = get_first(episode_item, ["video_id", "video", "trajectory_id", "traj_id"], None)
+        if trajectory_id is None:
+            trajectory_id = get_first(episode_item, ['episode_id', 'path_id', 'id'], '')
+        trajectory_id = str(trajectory_id)
+        scene_prefix = trajectory_id.split("_")[0] if "_" in trajectory_id else trajectory_id
+        try:
+            frames = get_episode_images(episode_item, image_root)
+        except Exception:
+            continue
+        if len(frames) == 0:
+            continue
+        if scene_prefix not in scene_pool:
+            scene_pool[scene_prefix] = {}
+        scene_pool[scene_prefix][trajectory_id] = frames
+    return scene_pool
+
+
+def compose_ffs_action(action_texts, start_idx):
+    merged_action = action_texts[start_idx]
+    last_action = action_texts[start_idx]
+    end_idx = start_idx
+    for i in range(start_idx + 1, len(action_texts)):
+        prob = random.random()
+        if prob <= 0.7 and action_texts[i] == last_action and combine(merged_action, last_action) is not None:
+            merged_action = combine(merged_action, last_action)
+            end_idx = i
+        else:
+            count = merged_action.count(',')
+            if count < 2:
+                merged_action += ', ' + action_texts[i]
+                end_idx = i
+            else:
+                break
+        last_action = action_texts[i]
+    return merged_action, end_idx
+
+
+def make_ffs_sample(episode_item, episode_image_list, action_texts, action_start_idx, action_end_idx, action_text, scene_pool, system_prompt, prompt_template):
+    total_actions = len(action_texts)
+    if action_start_idx >= total_actions:
+        return None
+    if action_end_idx + 1 >= len(episode_image_list):
+        return None
+
+    current_img = episode_image_list[action_start_idx]
+    true_next_img = episode_image_list[action_end_idx + 1]
+
+    history_imgs = episode_image_list[:action_start_idx]
+    if len(history_imgs) == 0:
+        history_imgs = [current_img]
+    if len(history_imgs) > 8:
+        history_imgs = uniform_sample_with_ends(history_imgs, 8)
+
+    # 1) Neighbor hard negative before the true next frame.
+    before_window_start = max(0, action_end_idx - 4)
+    neg1_candidates = episode_image_list[before_window_start:action_end_idx + 1]
+    neg1_filtered = [x for x in neg1_candidates if x != true_next_img]
+    neg1 = random.choice(neg1_filtered) if len(neg1_filtered) > 0 else None
+    if neg1 is None:
+        return None
+
+    # 2) Temporal negative in next 4 frames; for stop action, sample from previous 4 frames.
+    exclude_set = {true_next_img, neg1}
+    if action_texts[action_end_idx] == "stop":
+        neg2_candidates = episode_image_list[max(0, action_end_idx - 4):action_end_idx + 1]
+    else:
+        neg2_candidates = episode_image_list[action_end_idx + 2:min(len(episode_image_list), action_end_idx + 6)]
+        if len(neg2_candidates) == 0:
+            neg2_candidates = episode_image_list[max(0, action_end_idx - 4):action_end_idx + 1]
+    neg2_filtered = [x for x in neg2_candidates if x not in exclude_set]
+    neg2 = random.choice(neg2_filtered) if len(neg2_filtered) > 0 else None
+    if neg2 is None:
+        return None
+
+    # 3) Cross-trajectory negative from the same scene prefix.
+    trajectory_id = get_first(episode_item, ["video_id", "video", "trajectory_id", "traj_id"], None)
+    if trajectory_id is None:
+        trajectory_id = get_first(episode_item, ['episode_id', 'path_id', 'id'], '')
+    trajectory_id = str(trajectory_id)
+    scene_prefix = trajectory_id.split("_")[0] if "_" in trajectory_id else trajectory_id
+    neg3 = None
+    if scene_prefix in scene_pool:
+        cross_traj_candidates = []
+        for other_traj, frames in scene_pool[scene_prefix].items():
+            if other_traj == trajectory_id:
+                continue
+            for frame in frames:
+                if frame not in exclude_set and frame != neg2:
+                    cross_traj_candidates.append(frame)
+        if len(cross_traj_candidates) > 0:
+            neg3 = random.choice(cross_traj_candidates)
+    if neg3 is None:
+        return None
+
+    option_items = [
+        ("neg", neg1),
+        ("neg", neg2),
+        ("neg", neg3),
+        ("true", true_next_img),
+    ]
+    random.shuffle(option_items)
+    labels = ["A", "B", "C", "D"]
+    correct_label = None
+    option_images = []
+    for idx, (kind, img_path) in enumerate(option_items):
+        option_images.append(img_path)
+        if kind == "true":
+            correct_label = labels[idx]
+    if correct_label is None:
+        return None
+
+    history_tokens = "<image>" * len(history_imgs)
+    current_token = "<image>"
+    prompt = prompt_template.format(history_tokens, current_token, action_text)
+    prompt += " Option A: <image>, Option B: <image>, Option C: <image>, Option D: <image>."
+    sample = {
+        "system": system_prompt,
+        "messages": [
+            {
+                "from": "user",
+                "value": prompt,
+                "image": history_imgs + [current_img] + option_images,
+            },
+            {"from": "assistant", "value": correct_label},
+        ],
+        "episode_id": str(get_first(episode_item, ['episode_id', 'path_id', 'id'], '')),
+        "task type": "ffs",
+    }
+    return attach_llamafactory_mm(sample)
 
 
 def sample_vln_images(image_list):
@@ -146,19 +268,32 @@ def sample_vln_images(image_list):
     return history + [image_list[-1]]
 
 
+def build_vln_prompt(prompt_template, instruction, image_list):
+    history_count = max(0, len(image_list) - 1)
+    history_tokens = "<image>" * history_count
+    return prompt_template.format(history_tokens, "<image>", instruction)
+
+
+def normalize_vln_images(image_list):
+    if len(image_list) == 1:
+        return [image_list[0], image_list[0]]
+    return image_list
+
+
 def attach_llamafactory_mm(example):
     user = example["messages"][0]
     imgs = user.get("image", [])
     if not isinstance(imgs, list):
         imgs = [imgs] if imgs else []
     example["images"] = imgs[:]
-    user["value"] = "<image>" * len(imgs) + user["value"]
+    if "<image>" not in user["value"]:
+        user["value"] = "<image>" * len(imgs) + user["value"]
     if "image" in user:
         del user["image"]
     return example
 
 
-def process_single_type(annotation, image_root, system_prompt, prompt_template, task_type):
+def process_single_type(annotation, image_root, system_prompt, prompt_template, task_type, scene_pool=None):
     data2save = []
     for episode_item in tqdm(annotation):
         episode_id = get_first(episode_item, ['episode_id', 'path_id', 'id'], '')
@@ -166,9 +301,17 @@ def process_single_type(annotation, image_root, system_prompt, prompt_template, 
         if not isinstance(actions, list) or len(actions) == 0:
             continue
 
-        action_texts = [to_action_text(a) for a in actions]
-        if len(action_texts) > 0 and action_texts[-1] == "stop":
-            action_texts = action_texts[:-1]
+        all_action_texts = [to_action_text(a) for a in actions]
+        if len(all_action_texts) == 0:
+            continue
+
+        action_texts = all_action_texts[:]
+        while len(action_texts) > 0 and action_texts[0] == "stop":
+            action_texts = action_texts[1:]
+        if task_type == "idm":
+            action_texts = [a for a in action_texts if a != "stop"]
+        elif len(action_texts) > 0 and action_texts[-1] != "stop":
+            action_texts.append("stop")
         if len(action_texts) == 0:
             continue
 
@@ -195,13 +338,16 @@ def process_single_type(annotation, image_root, system_prompt, prompt_template, 
             tmp_data = {
                 "system": system_prompt,
                 "messages": [],
-                "action_history": [],
                 "episode_id": str(episode_id),
                 "task type": task_type,
             }
             if task_type == "vln":
-                formated_instruction = prompt_template.format(instruction)
-                tmp_data["messages"].append({"from": "user", "value": formated_instruction, "image": [episode_image_list[0]]})
+                formated_instruction = build_vln_prompt(prompt_template, instruction, [episode_image_list[0]])
+                tmp_data["messages"].append({
+                    "from": "user",
+                    "value": formated_instruction,
+                    "image": normalize_vln_images([episode_image_list[0]])
+                })
                 tmp_data["messages"].append({"from": "assistant", "value": action_texts[0]})
                 last_action = action_texts[0]
                 pending_rgb_list = []
@@ -218,8 +364,11 @@ def process_single_type(annotation, image_root, system_prompt, prompt_template, 
                         else:
                             out_item = copy.deepcopy(tmp_data)
                             out_item["messages"][0]["image"] = sample_vln_images(out_item["messages"][0]["image"])
+                            out_item["messages"][0]["image"] = normalize_vln_images(out_item["messages"][0]["image"])
+                            out_item["messages"][0]["value"] = build_vln_prompt(
+                                prompt_template, instruction, out_item["messages"][0]["image"]
+                            )
                             data2save.append(attach_llamafactory_mm(out_item))
-                            tmp_data["action_history"].append(tmp_data["messages"][1]['value'])
                             while len(pending_rgb_list) != 0:
                                 item = pending_rgb_list.pop(0)
                                 tmp_data["messages"][0]['image'].append(item)
@@ -228,9 +377,13 @@ def process_single_type(annotation, image_root, system_prompt, prompt_template, 
                     last_action = action_texts[i]
                 out_item = copy.deepcopy(tmp_data)
                 out_item["messages"][0]["image"] = sample_vln_images(out_item["messages"][0]["image"])
+                out_item["messages"][0]["image"] = normalize_vln_images(out_item["messages"][0]["image"])
+                out_item["messages"][0]["value"] = build_vln_prompt(
+                    prompt_template, instruction, out_item["messages"][0]["image"]
+                )
                 data2save.append(attach_llamafactory_mm(out_item))
             elif task_type == "idm":
-                formated_instruction = prompt_template
+                formated_instruction = prompt_template.format("<image>", "<image>")
                 tmp_data["messages"].append({"from": "user", "value": formated_instruction, "image": [episode_image_list[0], episode_image_list[1]]})
                 tmp_data["messages"].append({"from": "assistant", "value": action_texts[0]})
                 last_action = action_texts[0]
@@ -246,39 +399,68 @@ def process_single_type(annotation, image_root, system_prompt, prompt_template, 
                             tmp_data["messages"][-2]['image'][-1] = episode_image_list[i + 1]
                         else:
                             data2save.append(attach_llamafactory_mm(copy.deepcopy(tmp_data)))
-                            tmp_data["action_history"].append(tmp_data["messages"][1]['value'])
                             tmp_data["messages"][0]['image'] = [episode_image_list[i], episode_image_list[i + 1]]
                             tmp_data["messages"][1]['value'] = action_texts[i]
                     last_action = action_texts[i]
                 if tmp_data["messages"][1]['value'] != 'stop':
                     data2save.append(attach_llamafactory_mm(copy.deepcopy(tmp_data)))
+            elif task_type == "ffs":
+                if scene_pool is None:
+                    continue
+                i = 0
+                while i < len(action_texts):
+                    composed_action, end_idx = compose_ffs_action(action_texts, i)
+                    out_item = make_ffs_sample(
+                        episode_item=episode_item,
+                        episode_image_list=episode_image_list,
+                        action_texts=action_texts,
+                        action_start_idx=i,
+                        action_end_idx=end_idx,
+                        action_text=composed_action,
+                        scene_pool=scene_pool,
+                        system_prompt=system_prompt,
+                        prompt_template=prompt_template,
+                    )
+                    if out_item is not None:
+                        data2save.append(out_item)
+                    i = end_idx + 1
     return data2save
 
 
 def main(annotation_path, image_root, task_type_list, output_path):
-    system_prompt = "You are a helpful assistant."
+    system_prompt = "You are a visual language navigation model."
     vln_prompt_template = "Imagine you are a robot programmed for navigation tasks. " \
-        "You have been given a video of historical observations and an image of the current observation. " \
+        "You have been given a video of historical observations{} and an image of the current observation{}. " \
         "Your assigned task is: '{}'. Analyze this series of images to decide your next move, " \
         "which could involve turning left or right by a specific degree or moving forward a certain distance."
 
     idm_prompt_template = "Imagine you are a robot programmed for navigation tasks. " \
-        "You have been given an image of current view and an image of the goal view. " \
+        "You have been given an image of current view{} and an image of the goal view{}. " \
         "Analyze the two images to predict the navigation action that would move the robot from the current viewpoint to the goal view, " \
         "which could involve turning left " \
         "or right by a specific degree or moving forward a certain distance."
 
+    ffs_prompt_template = "Imagine you are a robot programmed for navigation tasks. " \
+        "You are given a history of observations{}, followed by the current observation{} and the executed action: [{}]. " \
+        "Then you are given four candidate next observations in order. " \
+        "Please select the correct option letter from A/B/C/D."
+
     data2save = []
     annotation = get_json_items(annotation_path)
+    scene_pool = None
+    if "ffs" in task_type_list:
+        scene_pool = build_scene_frame_pool(annotation, image_root)
 
     for task_type in task_type_list:
         if task_type == "vln":
             prompt_template = vln_prompt_template
         elif task_type == "idm":
             prompt_template = idm_prompt_template
+        elif task_type == "ffs":
+            prompt_template = ffs_prompt_template
         else:
             continue
-        data2save.extend(process_single_type(annotation, image_root, system_prompt, prompt_template, task_type))
+        data2save.extend(process_single_type(annotation, image_root, system_prompt, prompt_template, task_type, scene_pool=scene_pool))
 
     print(f"total number of samples = {len(data2save)}")
 
@@ -294,19 +476,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task_type",
         nargs="+",
-        default=["vln", "idm"],
+        default=["vln", "idm", "ffs"],
     )
     parser.add_argument(
         "--annotation_path",
         type=str,
-        default="/media/mldadmin/home/s125mdg38_06/StreamVLN/data/trajectory_data/R2R/annotations_v1-3.json",
+        default="/mnt/share172/cs22-hongly/DATACENTER/VLN_DATA/trajectory_data/R2R/annotations_v1-3.json",
     )
     parser.add_argument(
         "--image_root",
         type=str,
         default="data/images/r2r",
     )
-    parser.add_argument("--output_path", type=str, default='data/navida_train_data.jsonl')
+    parser.add_argument("--output_path", type=str, default='/mnt/share172/cs22-hongly/DATACENTER/VLN_DATA/trajectory_data/R2R/annotations_vlnidsffs.json')
     args = parser.parse_args()
 
     main(args.annotation_path, args.image_root, args.task_type, args.output_path)
