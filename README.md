@@ -12,7 +12,15 @@ pip install -e ".[torch,metrics]" --no-build-isolation -i https://mirrors.tuna.t
 ## 2. vllm
 ```bash
 pip install vllm==0.16.0
-bash VLN/scripts/vllm_qwenvln.sh
+conda activate vllm
+bash scripts/vllm_qwenvln.sh
+```
+
+在 `scripts/vllm_qwenvln.sh` 中修改 `BASE_MODEL`、`ADAPTER`、`CUDA_VISIBLE_DEVICES` 与端口后启动服务。评测前在 `vln` 环境中设置（端口需与脚本一致）：
+
+```bash
+export OPENAI_API_KEY=EMPTY
+export OPENAI_API_BASE=http://127.0.0.1:8001/v1
 ```
 
 ## 3. 仿真/交互环境（vln）
@@ -51,7 +59,58 @@ conda activate vln
 python tool/download_scannetv2.py
 ```
 
-## 7. dagger运行
+## 7. NaVIDA 评测（vLLM + Habitat）
+
+通过 OpenAI 兼容 API 调用本地 vLLM，在 VLN-CE（R2R / RxR）上跑 NaVIDA 式多图导航评测。
+
+| 脚本 | 说明 |
+|------|------|
+| `vln/eval_vllm.py` | **原版**：每条 episode 只评测 1 次，`trial_id=0`、`trial_total=1` |
+| `vln/eval_vllm_navida.py` | **pass@k**：同一条轨迹跑 `k` 次，汇总 `pass@k` / `avg@k` |
+
+**流程**：先 `bash scripts/vllm_qwenvln.sh` 启动 vLLM，再在仓库根目录修改 `scripts/eval_vllm.sh` 中的 `CONFIG_PATH`、`SAVE_PATH`、`OPENAI_API_BASE` 后执行：
+
+```bash
+conda activate vln
+bash scripts/eval_vllm.sh
+```
+
+仓库内 `scripts/eval_vllm.sh` 默认调用 `eval_vllm_navida.py` 且 `--pass-k 4`；若要用原版单次评测，将其中 Python 入口改为 `eval_vllm.py` 并去掉 `--pass-k`。
+
+**`eval_vllm.py` 命令示例（原版，单次）**
+
+```bash
+export PYTHONPATH=$(pwd):$PYTHONPATH
+export OPENAI_API_KEY=EMPTY
+export OPENAI_API_BASE=http://127.0.0.1:8001/v1
+
+python vln/eval_vllm.py \
+  --exp-config config/vln_r2r.yaml \
+  --split-num 16 \
+  --result-path ./results/navida_r2r_single \
+  --forward-distance 25 \
+  --turn-angle 15 \
+  --max-action-history 200 \
+  --num-generations 1
+```
+
+**`eval_vllm_navida.py` 命令示例（pass@k）**
+
+```bash
+python vln/eval_vllm_navida.py \
+  --exp-config config/vln_r2r.yaml \
+  --split-num 16 \
+  --pass-k 4 \
+  --result-path ./results/navida_r2r_pass4 \
+  --forward-distance 25 \
+  --turn-angle 15 \
+  --max-action-history 200 \
+  --num-generations 1
+```
+
+结果写入 `--result-path/result.json`（JSONL）：每行一条 episode（navida 含 `trial_id` / `trial_total`），**最后一行**为汇总指标。中断后重跑会自动跳过已完成条目。
+
+## 8. dagger运行
 ```bash
 bash scripts/habitat.sh
 ```
