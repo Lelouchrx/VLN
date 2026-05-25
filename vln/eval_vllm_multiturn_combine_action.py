@@ -94,7 +94,7 @@ def load_done_result_keys(result_path_or_file):
 
 def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path, num_generations,
                    forward_distance, turn_angle, max_action_history, resolution_ratio,
-                   enable_early_stop, skip_result_file) -> None:
+                   enable_early_stop, skip_result_file, save_sharegpt, save_video) -> None:
 
     env = Env(config.habitat, dataset)
 
@@ -107,6 +107,8 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
         max_action_history,
         resolution_ratio,
         num_generations,
+        require_map=save_video,
+        save_sharegpt=save_sharegpt,
     )
 
     num_episodes = len(env.episodes)
@@ -170,12 +172,13 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
             "steps": iter_step,
             "episode_instruction": episode_instruction
         }
-        agent.dump_sharegpt(
-            scene_id=scene_id,
-            episode_id=episode_id,
-            steps=iter_step,
-            trial_id=0,
-        )
+        if save_sharegpt:
+            agent.dump_sharegpt(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                steps=iter_step,
+                trial_id=0,
+            )
         with open(os.path.join(result_path, "result.json"), "a") as f:
             f.write(json.dumps(result) + "\n")
         done_result_keys.add((scene_id, str(episode_id), episode_instruction))
@@ -192,19 +195,21 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
 class MultiTurn_Agent(Agent):
     def __init__(self, api_key, base_url, result_path, forward_distance,
                  turn_angle, max_action_history, resolution_ratio, num_generations=1,
-                 require_map=True):
+                 require_map=False, save_sharegpt=False):
 
         print("Initialize MultiTurn Agent")
 
         self.result_path = result_path
         self.require_map = require_map
+        self.save_sharegpt = save_sharegpt
         self.forward_distance = forward_distance
         self.turn_angle = turn_angle
         self.resolution_ratio = resolution_ratio
         self.max_action_history = max_action_history
         self.num_generations = num_generations
         os.makedirs(self.result_path, exist_ok=True)
-        os.makedirs(os.path.join(self.result_path, "video"), exist_ok=True)
+        if self.require_map:
+            os.makedirs(os.path.join(self.result_path, "video"), exist_ok=True)
 
         self.client = OpenAI(
             api_key=api_key,
@@ -475,14 +480,15 @@ class MultiTurn_Agent(Agent):
             "content": assistant_text,
         })
 
-        self.sharegpt_conversations.append({
-            "from": "human",
-            "value": user_text_for_sharegpt,
-        })
-        self.sharegpt_conversations.append({
-            "from": "gpt",
-            "value": assistant_text,
-        })
+        if self.save_sharegpt:
+            self.sharegpt_conversations.append({
+                "from": "human",
+                "value": user_text_for_sharegpt,
+            })
+            self.sharegpt_conversations.append({
+                "from": "gpt",
+                "value": assistant_text,
+            })
         self.is_first_round = False
 
         if self.require_map:
@@ -502,7 +508,7 @@ def main():
 
     parser.add_argument("--exp-config", type=str, required=True, help="path to config yaml containing info about experiment")
     parser.add_argument("--split-num", type=int, required=True, help="chunks of evluation")
-    parser.add_argument("--resolution-ratio", type=float, help="image resize ratio", default=0.5)
+    parser.add_argument("--resolution-ratio", type=float, help="image resize ratio", default=1.0)
     parser.add_argument("--result-path", type=str, required=True, help="location to save results")
     parser.add_argument("--forward-distance", type=int, help="distance that one forward action takes", default=25)
     parser.add_argument("--turn-angle", type=int, help="angle that one turn action takes", default=15)
@@ -512,6 +518,10 @@ def main():
                         help="Enable heuristic early stop based on repeated no-progress rotation or max steps.")
     parser.add_argument("--skip-result-file", type=str, default=None,
                         help="Optional extra result json/jsonl(or dir) to skip already-finished episodes.")
+    parser.add_argument("--save-sharegpt", action="store_true", default=False,
+                        help="Save ShareGPT json under result-path/sharegpt/")
+    parser.add_argument("--save-video", action="store_true", default=False,
+                        help="Save per-episode top-down GIF under result-path/video/")
     args = parser.parse_args()
     if args.skip_result_file is None:
         default_skip_file = os.path.join(args.result_path, "result.json")
@@ -557,7 +567,7 @@ def main():
         worker_args = (result_queue, api_key, base_url, config, dataset_splits[i], args.result_path,
                        args.num_generations, args.forward_distance, args.turn_angle,
                        args.max_action_history, args.resolution_ratio, args.enable_early_stop,
-                       args.skip_result_file)
+                       args.skip_result_file, args.save_sharegpt, args.save_video)
         p = mp.Process(target=evaluate_agent, args=worker_args, daemon=True)
         p.start()
         processes.append(p)
