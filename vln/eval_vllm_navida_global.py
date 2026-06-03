@@ -67,7 +67,7 @@ def load_done_result_keys(result_path):
 
 def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_path, num_generations,
                     forward_distance, turn_angle, max_action_history, resolution_ratio,
-                    save_video, pass_k) -> None:
+                    save_video, pass_k, num_history_frames) -> None:
 
     env = Env(config.habitat, dataset)
 
@@ -80,6 +80,7 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
         max_action_history,
         resolution_ratio,
         num_generations,
+        num_history_frames,
         save_video=save_video)
 
     num_episodes = len(env.episodes)
@@ -162,7 +163,7 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
 class NaVIDA_Agent(Agent):
     def init(self, base_url, model_name, result_path, forward_distance,
                     turn_angle, max_action_history, resolution_ratio, num_generations = 1,
-                    save_video=False):
+                    num_history_frames=32, save_video=False):
 
         print("Initialize NaVIDA")
 
@@ -173,6 +174,7 @@ class NaVIDA_Agent(Agent):
         self.resolution_ratio = resolution_ratio
         self.max_action_history = max_action_history
         self.num_generations = num_generations
+        self.num_history_frames = num_history_frames
         os.makedirs(self.result_path, exist_ok=True)
         if self.save_video:
             os.makedirs(os.path.join(self.result_path, "video"), exist_ok=True)
@@ -205,34 +207,10 @@ class NaVIDA_Agent(Agent):
         if len(data) <= n:
             return data
         if n <= 1:
-            # global sampling can request a single frame; take the most recent.
             return data[-1:]
 
         indices = [round(i * (len(data) - 1) / (n - 1)) for i in range(n)]
         return [data[i] for i in indices]
-
-    def global_num_frames(self, n):
-        # "global" sampling: number of history frames to feed grows with the
-        # total number of available history frames n.
-        #   1-3   -> 1
-        #   4-7   -> 2
-        #   8-15  -> 4
-        #   16-31 -> 8
-        #   32-63 -> 16
-        #   64+   -> 32
-        if n <= 3:
-            return 1
-        elif n <= 7:
-            return 2
-        elif n <= 15:
-            return 4
-        elif n <= 31:
-            return 8
-        elif n <= 63:
-            return 16
-        else:
-            return 32
-
 
     def predict_inference(self):
         client = self.clients[self._client_idx % len(self.clients)]
@@ -367,9 +345,8 @@ class NaVIDA_Agent(Agent):
         rgb_ = Image.fromarray(rgb.astype('uint8')).convert('RGB')
         # rgb_ = rgb_.resize((308,252))
         self.rgb_list.append(rgb_)
-        # global sampling needs the FULL trajectory: keep every frame and let
-        # global_num_frames() decide how many to sample. Only trim as a safety
-        # bound (max_action_history defaults large; set huge in the launcher).
+        # uniform sampling: keep full trajectory; sample fixed num_history_frames.
+        # Only trim as a safety bound (max_action_history).
         if self.max_action_history > 0 and len(self.rgb_list) > self.max_action_history:
             self.rgb_list = self.rgb_list[1:]
 
@@ -391,7 +368,7 @@ class NaVIDA_Agent(Agent):
 
         content.append({"type": "text", "text": 'Imagine you are a robot programmed for navigation tasks. You have been given a video of historical observations'})
         if len(self.rgb_list) > 1:
-            content.extend([{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(item)}"}} for item in self.uniform_sample_with_ends(self.rgb_list[:-1], self.global_num_frames(len(self.rgb_list[:-1])))])
+            content.extend([{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(item)}"}} for item in self.uniform_sample_with_ends(self.rgb_list[:-1], self.num_history_frames)])
         else:
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(self.rgb_list[-1])}"}})
         content.append({"type": "text", "text": 'and an image of the current observation'})
@@ -462,6 +439,13 @@ def main():
         action="store_true",
         help="if set, save per-episode top-down+gifs under result-path/video",
     )
+    parser.add_argument(
+        "--num-history-frames",
+        type=int,
+        default=32,
+        choices=[2, 4, 8, 16, 32],
+        help="uniform sample count for historical observations (not adaptive)",
+    )
     args = parser.parse_args()
 
     config = get_config(args.exp_config)
@@ -511,6 +495,7 @@ def main():
             args.resolution_ratio,
             args.save_vedio,
             args.pass_k,
+            args.num_history_frames,
         )
         p = mp.Process(target=evaluate_agent, args=worker_args, daemon=True)
         p.start()
@@ -656,5 +641,5 @@ def main():
     with open(result_file, "a") as f:
         f.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
-if name == "main":
+if __name__ == "__main__":
     main()
