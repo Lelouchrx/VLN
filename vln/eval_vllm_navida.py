@@ -2,7 +2,6 @@ import json
 import numpy as np
 from habitat import Env
 from habitat.core.agent import Agent
-from tqdm import trange
 import os
 import re
 from tqdm import tqdm
@@ -29,9 +28,22 @@ from io import BytesIO
 SYSTEM_PROMPT = "You are a helpful assistant."
 
 def encode_image_base64(image):
+    # Cache the JPEG+base64 encoding on the image object itself: each frame is
+    # encoded exactly once and reused for every step / pass-k trial it appears
+    # in. This saves CPU and -- more importantly -- keeps the bytes byte-identical
+    # across requests, so vLLM's multimodal cache (and prefix cache) actually hit
+    # instead of missing on re-encoded frames.
+    cached = getattr(image, "_b64_cache", None)
+    if cached is not None:
+        return cached
     buffer = BytesIO()
     image.save(buffer, format="JPEG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    try:
+        image._b64_cache = encoded
+    except (AttributeError, TypeError):
+        pass
+    return encoded
 
 def seed_all():
     np.random.seed(41)
@@ -65,32 +77,54 @@ def load_done_result_keys(result_path):
                 )
     return done
 
-def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path, num_generations,
+def _pt_to_polyline_xz(px, pz, path_xz):
+    """Min distance from point (px,pz) to the reference-path polyline (xz). Used
+    as cross-track error for the deviation analysis."""
+    best = 1e9
+    for i in range(len(path_xz) - 1):
+        ax, az = path_xz[i]; bx, bz = path_xz[i + 1]
+        dx, dz = bx - ax, bz - az
+        L2 = dx * dx + dz * dz
+        t = 0.0 if L2 < 1e-9 else max(0.0, min(1.0, ((px - ax) * dx + (pz - az) * dz) / L2))
+        cx, cz = ax + t * dx, az + t * dz
+        d = ((px - cx) ** 2 + (pz - cz) ** 2) ** 0.5
+        if d < best:
+            best = d
+    if len(path_xz) == 1:
+        best = ((px - path_xz[0][0]) ** 2 + (pz - path_xz[0][1]) ** 2) ** 0.5
+    return best
+
+def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_path, num_generations,
                     forward_distance, turn_angle, max_action_history, resolution_ratio,
                     save_video, pass_k) -> None:
- 
+
     env = Env(config.habitat, dataset)
 
     agent = NaVIDA_Agent(
-        api_key, 
-        base_url, 
-        result_path, 
-        forward_distance, 
-        turn_angle, 
-        max_action_history, 
-        resolution_ratio, 
+        base_url,
+        model_name,
+        result_path,
+        forward_distance,
+        turn_angle,
+        max_action_history,
+        resolution_ratio,
         num_generations,
         save_video=save_video)
 
     num_episodes = len(env.episodes)
     done_result_keys = load_done_result_keys(result_path)
-    
+
+    episodes_snapshot = list(env.episodes)
+
     EARLY_STOP_ROTATION = 25
     EARLY_STOP_STEPS = 400
 
-    for _ in range(num_episodes):
+    # for _ in range(num_episodes):
+    for target_ep in episodes_snapshot:
         for trial_id in range(pass_k):
             episode_start_time = time.time()
+
+            env.current_episode = target_ep
 
             obs = env.reset()
             iter_step = 0
@@ -110,8 +144,21 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
                 t_dict["skipped"] = 1
                 result_queue.put(t_dict)
                 continue
+
+            # per-step deviation analysis: distance-to-goal + cross-track error to
+            # the reference path (always recorded into the result).
+            ref_path = getattr(env.current_episode, "reference_path", None)
+            _ref_xz = [[float(p[0]), float(p[2])] for p in ref_path] if ref_path else None
+            dtg_trace = []; xte_trace = []
+
             while not env.episode_over:
                 info = env.get_metrics()
+
+                dtg_trace.append(round(float(info["distance_to_goal"]), 3))
+                if _ref_xz is not None:
+                    _st = env.sim.get_agent_state()
+                    xte_trace.append(round(_pt_to_polyline_xz(
+                        float(_st.position[0]), float(_st.position[2]), _ref_xz), 3))
 
                 if info["distance_to_goal"] != last_dtg:
                     last_dtg = info["distance_to_goal"]
@@ -138,6 +185,13 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
                 "os": info["oracle_success"],
                 "ne": info["distance_to_goal"],
                 "steps": iter_step,
+                "n_rounds": getattr(agent, "_stat_rounds", 0),
+                "hist_frames": list(getattr(agent, "_stat_histframes", [])),
+                "subact_ids": list(getattr(agent, "_stat_subacts", [])),
+                "subact_mags": list(getattr(agent, "_stat_submag", [])),
+                "infer_time_s": round(getattr(agent, "_stat_infer_time", 0.0), 3),
+                "dtg_trace": dtg_trace,
+                "xte_trace": xte_trace,
                 "episode_instruction": episode_instruction
             }
             with open(os.path.join(result_path, "result.json"), "a") as f:
@@ -148,12 +202,12 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
             result_queue.put(t_dict)
 
 class NaVIDA_Agent(Agent):
-    def __init__(self, api_key, base_url, result_path, forward_distance, 
+    def __init__(self, base_url, model_name, result_path, forward_distance,
                     turn_angle, max_action_history, resolution_ratio, num_generations = 1,
                     save_video=False):
-        
+
         print("Initialize NaVIDA")
-        
+
         self.result_path = result_path
         self.save_video = save_video
         self.forward_distance = forward_distance
@@ -165,12 +219,11 @@ class NaVIDA_Agent(Agent):
         if self.save_video:
             os.makedirs(os.path.join(self.result_path, "video"), exist_ok=True)
 
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
-        self.model = self.client.models.list().data[0].id
-        
+        urls = [u.strip() for u in base_url.split(",") if u.strip()]
+        self.clients = [OpenAI(base_url=url, api_key="dummy", timeout=600) for url in urls]
+        self._client_idx = 0
+        self.model = model_name
+
         self.temperature = 0.3
         self.top_p = 0.95
         self.max_tokens = 512
@@ -180,7 +233,7 @@ class NaVIDA_Agent(Agent):
             "Your assigned task is: '{}'. Analyze this series of images to decide your next move, "\
             "which could involve turning left or right by a specific degree or moving forward a certain distance."
         self.history_rgb_tensor = None
-        
+
         self.rgb_list = []
         self.topdown_map_list = []
         self.conversations = []
@@ -198,19 +251,42 @@ class NaVIDA_Agent(Agent):
         indices = [round(i * (len(data) - 1) / (n - 1)) for i in range(n)]
         return [data[i] for i in indices]
 
+    def _scaled(self, img, scale):
+        # Cached downscaled copy -> bytes stay identical across steps so vLLM's
+        # multimodal cache hits. (No-op at scale 1.0, i.e. the default path.)
+        if scale is None or scale >= 0.999:
+            return img
+        cache = getattr(img, "_scaled_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                img._scaled_cache = cache
+            except Exception:
+                pass
+        if scale not in cache:
+            w, h = img.size
+            cache[scale] = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        return cache[scale]
 
     def predict_inference(self):
+        client = self.clients[self._client_idx % len(self.clients)]
+        self._client_idx += 1
 
-        outputs = self.client.chat.completions.create(
+        _t0 = time.time()
+        outputs = client.chat.completions.create(
             messages=self.conversations,
             model=self.model,
             max_completion_tokens=self.max_tokens,
             temperature=self.temperature,
             top_p=self.top_p,
         )
+        self._stat_infer_time += (time.time() - _t0)   # cumulative inference latency
+
         output_text = outputs.choices[0].message.content
+        output_text = re.sub(r'<think>.*?</think>', '', output_text, flags=re.DOTALL)
         output_text = output_text.strip()
-        
+        # print(f"[Model Output] {output_text}")
+
         return output_text
 
     def extract_multi_result(self, output):
@@ -249,13 +325,13 @@ class NaVIDA_Agent(Agent):
             match = match.group()
             return 3, float(match)
         return None, None
-    
+
 
     def addtext(self, image, instuction, navigation):
         h, w = image.shape[:2]
         new_height = h + 150
         new_image = np.zeros((new_height, w, 3), np.uint8)
-        new_image.fill(255)  
+        new_image.fill(255)
         new_image[:h, :w] = image
 
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -300,8 +376,8 @@ class NaVIDA_Agent(Agent):
             return "turn right"
         else:
             raise ValueError(f"Invalid action ID: {action_id}")
-        
-    def reset(self):       
+
+    def reset(self):
         if self.save_video:
             if len(self.topdown_map_list)!=0:
                 output_video_path = os.path.join(self.result_path, "video","{}.gif".format(self.episode_id))
@@ -312,12 +388,18 @@ class NaVIDA_Agent(Agent):
 
         self.pending_action_list = []
         self.rgb_list = []
+        # per-episode stats (action distribution / inference rounds / history frames)
+        self._stat_rounds = 0
+        self._stat_histframes = []     # #images sent to the model each inference round
+        self._stat_subacts = []        # action-type ids the model emitted (0/1/2/3)
+        self._stat_submag = []         # [type_id, magnitude] pairs (cm or degrees)
+        self._stat_infer_time = 0.0    # cumulative predict_inference wall time (s)
 
         self.conversations = []
         self.conversations.append({
             "role": "system",
             "content": [{"type": "text", "text": SYSTEM_PROMPT}]})
-        
+
     def act(self, observations, info, episode_id):
 
         self.episode_id = episode_id
@@ -337,7 +419,7 @@ class NaVIDA_Agent(Agent):
 
         if len(self.pending_action_list) != 0 :
             temp_action = self.pending_action_list.pop(0)
-            
+
             if self.save_video:
                 img = self.addtext(output_im, observations["instruction"]["text"], "Pending action: {}".format(temp_action))
                 self.topdown_map_list.append(img)
@@ -363,13 +445,22 @@ class NaVIDA_Agent(Agent):
                 "content": content
             })
 
+        # stats: this is one inference round; count the images actually sent.
+        self._stat_rounds += 1
+        self._stat_histframes.append(sum(1 for c in content if c.get("type") == "image_url"))
+
         navigation = self.predict_inference()
-        
+
         if self.save_video:
             img = self.addtext(output_im, observations["instruction"]["text"], navigation)
             self.topdown_map_list.append(img)
-        
+
         result = self.extract_multi_result(navigation)
+        # stats: record the action-type ids (+ magnitudes) the model emitted
+        for _ai, _num in result:
+            if _ai is not None:
+                self._stat_subacts.append(int(_ai))
+                self._stat_submag.append([int(_ai), (None if _num is None else int(_num))])
 
         select_action_idx = 2
 
@@ -389,7 +480,7 @@ class NaVIDA_Agent(Agent):
             elif action_index == 3:
                 for _ in range(min(3,round(numeric/self.turn_angle))):
                     self.pending_action_list.append(3)
-            
+
             if action_index is None or len(self.pending_action_list)==0:
                 print('random select an action')
                 action_index = random.randint(1, 3)
@@ -412,6 +503,9 @@ def main():
     parser.add_argument("--max-action-history",type=int,help="the maximum num of action history",default=10)
     parser.add_argument("--num-generations",type=int,help="whether use video or multi image",default=1)
     parser.add_argument("--pass-k", type=int, default=1, help="run each trajectory k times")
+    parser.add_argument("--vllm_base_url", type=str, default="http://localhost:8001/v1",
+                        help="vLLM base URL(s), comma-separated for multiple servers")
+    parser.add_argument("--vllm_model_name", type=str, default="qwen3vl")
     parser.add_argument(
         "--save_vedio",
         action="store_true",
@@ -419,34 +513,30 @@ def main():
     )
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("OPENAI_API_BASE")
-    assert api_key is not None and base_url is not None
-
     config = get_config(args.exp_config)
     with habitat.config.read_write(config):
-        # self.config.habitat.task.measurements.success.success_distance=3.0
-        config.habitat.task.measurements.update(
-            {
-                "top_down_map": TopDownMapMeasurementConfig(
-                    map_padding=3,
-                    map_resolution=1024,
-                    draw_source=True,
-                    draw_border=True,
-                    draw_shortest_path=True,
-                    draw_view_points=True,
-                    draw_goal_positions=True,
-                    draw_goal_aabbs=True,
-                    fog_of_war=FogOfWarConfig(
-                        draw=True,
-                        visibility_dist=5.0,
-                        fov=90,
+        if args.save_vedio:
+            config.habitat.task.measurements.update(
+                {
+                    "top_down_map": TopDownMapMeasurementConfig(
+                        map_padding=3,
+                        map_resolution=1024,
+                        draw_source=True,
+                        draw_border=True,
+                        draw_shortest_path=True,
+                        draw_view_points=True,
+                        draw_goal_positions=True,
+                        draw_goal_aabbs=True,
+                        fog_of_war=FogOfWarConfig(
+                            draw=True,
+                            visibility_dist=5.0,
+                            fov=90,
+                        ),
                     ),
-                ),
-                "collisions": CollisionsMeasurementConfig(),
-            }
-        )
-            
+                    "collisions": CollisionsMeasurementConfig(),
+                }
+            )
+
     dataset = habitat.datasets.make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
     dataset_splits = dataset.get_splits(args.split_num, allow_uneven_splits=True)
 
@@ -458,8 +548,8 @@ def main():
     for i in range(args.split_num):
         worker_args = (
             result_queue,
-            api_key,
-            base_url,
+            args.vllm_base_url,
+            args.vllm_model_name,
             config,
             dataset_splits[i],
             args.result_path,
@@ -476,11 +566,20 @@ def main():
         processes.append(p)
 
     with tqdm(total=num_episodes * args.pass_k, desc="Evaluating") as pbar:
-        for _ in range(num_episodes * args.pass_k):
-            result = result_queue.get()
-            pbar.update(1)
-            pbar.set_postfix(**result)
-    
+        done_count = 0
+        target = num_episodes * args.pass_k
+        while done_count < target:
+            alive = [p for p in processes if p.is_alive()]
+            try:
+                result = result_queue.get(timeout=10)
+                done_count += 1
+                pbar.update(1)
+                pbar.set_postfix(**result)
+            except Exception:
+                if not alive:
+                    print(f"All workers exited. Got {done_count}/{target} results.")
+                    break
+
     for p in processes:
         p.join()
 
